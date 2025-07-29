@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+COPY requirements.txt /app/
+RUN pip install -r /app/requirements.txt
+
+COPY utils/ app/utils/
+COPY main_createBatches.py /app/
+COPY main_retrieveBatches.py /app/
+COPY .env /app/
+COPY rough_work/ /app/rough_work/
+COPY data/ /app/data/
+
+
+WORKDIR /app/
+
+RUN ["python", "rough_work/ingestion.py"]
+# RUN ["python", "main_createBatches.py", ">", "log.txt"]

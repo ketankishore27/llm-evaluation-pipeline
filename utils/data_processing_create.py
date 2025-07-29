@@ -3,24 +3,87 @@ import asyncio
 from utils.llm_operations_langchain import prompt_exm, parser, create_batch_yaml_sample
 import json
 import sqlite3
-from typing import Literal
+from urllib.parse import quote_plus
+from sqlalchemy import create_engine
+import psycopg2
+from dotenv import load_dotenv
+import os
+import sqlite3
+load_dotenv(override=True)
 
-def get_data(mode: Literal["db", "csv"], filePath=None):
-    print("*" * 8, "Get-Data")
 
-    if mode == "db":
-        conn = sqlite3.connect('conversations.db')
-        data = pd.read_sql_query("SELECT * FROM conversations", conn)
-        conn.close()
+def get_data_postgres():
 
-    else:
-        try:
-            data = pd.read_csv(filePath)
-        except Exception as e:
-            raise "Provide FilePath"
-        
+    """
+    Retrieves conversation data from the remote PostgreSQL database, 
+    filtered by conversation time of the current and previous day.
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame containing the retrieved data.
+    """
+
+    print("*" * 8, "Get-Data Server")
+    try:
+        conversation_schema=os.getenv("conversation_db_schema", None)
+        conversation_table_name=os.getenv("conversation_table_name", None)
+        conn_params_conversation = {
+                'host': os.getenv("hostName_dev", None), 
+                'port': '5432', 
+                'dbname': os.getenv("conversation_db_name", None), 
+                'user': os.getenv("user_name", None), 
+                'password': os.getenv("password", None)
+        }
+        current_date = pd.to_datetime('2023-06-25').date() #pd.Timestamp.now().date()
+        prev_date = current_date - pd.Timedelta(days=1)
+
+        engine = create_engine(f"postgresql+psycopg2://{conn_params_conversation['user']}:{quote_plus(conn_params_conversation['password'])}@{conn_params_conversation['host']}:{conn_params_conversation['port']}/{conn_params_conversation['dbname']}")
+        data = pd.read_sql(f"SELECT * FROM {conversation_schema}.{conversation_table_name}", engine)
+        data["conversation time"] = data["conversation time"].apply(lambda x: pd.to_datetime(x))
+        data["conversation_date"] = data["conversation time"].apply(lambda x: x.date())
+        data_sample = data[(data["conversation_date"] > prev_date) & (data["conversation_date"] <= current_date)]
+        data_sample = data_sample.rename(columns = {"conversation time": "conversation_time"})
+        engine.dispose()
+        return data_sample
+
+    except Exception as e:
+        print(e)
+
+def get_data_local():
+
+    print("*" * 8, "Get-Data Local")
+    conn = sqlite3.connect('conversations.db')
+    data = pd.read_sql_query("SELECT * FROM conversations", conn)
+    conn.close()
     data_sample = data[data['sender_id'].isin(['Ny7i23GjoezOA_h6NjwIK', 'btLyma2P7Yq2Owe9R5O17', 'yCCKo0asCCrhjWVvgCGQw'])]
     return data_sample
+
+
+def get_data():
+
+    """
+    Retrieves conversation data based on run_config environment variable.
+
+    If run_config is "server", data is retrieved from the remote PostgreSQL database.
+    If run_config is "local", data is retrieved from a local SQLite database.
+
+    Args:
+        None
+    
+    Returns:
+        pd.DataFrame: A pandas DataFrame containing the retrieved data.
+    
+    Raises:
+        "Try Catch Exception: No Valid run_config found while extracting data"
+    """
+
+    if os.getenv("run_config", None) == "server":
+        return get_data_postgres()
+
+    elif os.getenv("run_config", None) == "local":
+        return get_data_local()
+    
+    else:
+        raise "Try Catch Exception: No Valid run_config found while extracting data"
 
 def set_slot_processing(text):
     replaced_text = text.replace("/SetSlots(", "clicks `").replace("=", "` button with `").replace(")", "`")
@@ -64,23 +127,56 @@ async def process_all_senders(data):
     results = await asyncio.gather(*tasks)
     return results
 
-def update_batch_information(batch_response, cursor, table):
-
+def update_batch_postgres(batch_response, cursor):
     print("*" * 8, "Update BatchInfo in csv")
-
     batch_id = batch_response.id
     status = batch_response.status
     created_at = batch_response.created_at
-
-    sql_String = f"""INSERT INTO {table} 
+    schema_name = os.getenv("track_db_schema", None)
+    table_name = os.getenv("track_table_name", None)
+    sql_String = f"""INSERT INTO {schema_name}.{table_name} 
                     (batch_id, job_status, creation_time, tracking_reference) 
                     VALUES ('{batch_id}', '{status}', '{created_at}', 'TRACK');
                 """
     
     cursor.execute(sql_String)
     cursor.connection.commit()
-        
     return True
+
+def update_batch_local(batch_response, cursor):
+
+    print("*" * 8, "Update BatchInfo in csv")
+    try:
+        batch_id = batch_response.id
+        status = batch_response.status
+        created_at = batch_response.created_at
+        table = "track_status"
+        sql_String = f"""INSERT INTO {table} 
+                        (batch_id, job_status, creation_time, tracking_reference) 
+                        VALUES ('{batch_id}', '{status}', '{created_at}', 'TRACK');
+                    """
+        
+        cursor.execute(sql_String)
+        cursor.connection.commit()
+        return True
+    
+    except Exception as e:
+        cursor.connection.rollback()
+        raise "Error in updating Tracking DB, Rolling Back"
+    
+    finally:
+        cursor.connection.close()
+
+def update_batch_information(batch_response, cursor):
+    
+    if os.getenv("run_config", None) == "server":
+        return update_batch_postgres(batch_response, cursor)
+
+    elif os.getenv("run_config", None) == "local":
+        return update_batch_local(batch_response, cursor)
+    
+    else:
+        raise "Try Catch Exception: No Valid run_config found while updating"
 
 
 def export_batch_file(filePath, client):
@@ -120,8 +216,40 @@ def create_batchRequest_db(name: str):
 
     return cursor
 
-def check_db_connection(name: str):
+def check_postgres_connection():
 
+    print("*" * 8, "Check Posstgres Connection")
+    schema_name = os.getenv("track_db_schema")
+    try:
+        conn_params_track = {
+                'host': os.getenv("hostName_dev", None), 
+                'port': '5432', 
+                'dbname': os.getenv("track_db_name", None), 
+                'user': os.getenv("user_name", None), 
+                'password': os.getenv("password", None)
+        }
+        conn = psycopg2.connect(**conn_params_track)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = '{schema_name}'
+                """)
+        tables = cursor.fetchall()
+        table_names = [i[0] for i in tables]
+        
+        if len(table_names) == 0:
+            return None
+        
+        else:
+            return cursor
+
+    except Exception as e:
+        return None
+
+def check_sqlite_connection():
+
+    name = "track_status"
     print("*" * 8, "Check DB Connection")
     try:
         conn = sqlite3.connect(f'{name}.db')
@@ -141,65 +269,21 @@ def check_db_connection(name: str):
     except Exception as e:
         return None
 
+def check_db_connection():
+
+    if os.getenv("run_config", None) == "server":
+        return check_postgres_connection()
+    
+    elif os.getenv("run_config", None) == "local":
+        return check_sqlite_connection()
+    
+    else:
+        raise "Try Catch Exception: No Valid Tracking DB Connection found"
+        
+
 def view_db_connection(name: str, conn):
 
     df = pd.read_sql_query(f"SELECT * from {name} limit 10", conn)
     print(df)
     return df
 
-## Sample Batch ID
-# batch_response = {
-    #                     "id": "batch_3e62a3ce-d7c4-417b-b078-e2044502734c",
-    #                     "completion_window": "24h",
-    #                     "created_at": 1751743797,
-    #                     "endpoint": "/chat/completions",
-    #                     "input_file_id": "file-ee1aa3ac317a44258c136e6be0b00040",
-    #                     "object": "batch",
-    #                     "status": "validating",
-    #                     "cancelled_at": None,
-    #                     "cancelling_at": None,
-    #                     "completed_at": None,
-    #                     "error_file_id": "",
-    #                     "errors": None,
-    #                     "expired_at": None,
-    #                     "expires_at": 1751830197,
-    #                     "failed_at": None,
-    #                     "finalizing_at": None,
-    #                     "in_progress_at": None,
-    #                     "metadata": None,
-    #                     "output_file_id": "",
-    #                     "request_counts": {
-    #                         "completed": 0,
-    #                         "failed": 0,
-    #                         "total": 0
-    #                     }
-    #         }
-
-
-    ## Sample File ID
-    # file = {
-    #             "id": "file-ee1aa3ac317a44258c136e6be0b00040",
-    #             "bytes": 15264,
-    #             "created_at": 1751743680,
-    #             "filename": "messages.jsonl",
-    #             "object": "file",
-    #             "purpose": "batch",
-    #             "status": "processed",
-    #             "expires_at": None,
-    #             "status_details": None
-    #             }  
-
-
-
-
-## LookUps
-
-    # sample_result = chain.invoke({"chat_transcript": conversation})
-    
-    # return [sender_id, conversation_start_time, conversation_end_time, sample_result['score'], 
-    #         sample_result["reasoning"], sample_result["satisfaction_label"]]
-
-#   'hwSa9Mae-O_6c0xJc37zF', 'RPMjuJdSxBXIm9vqszJUm',
-#   'yCCKo0asCCrhjWVvgCGQw', '-88c_dXBTRYD5ynmnJDAK',
-#   'bDcNLASmqhPn0oGJQds8u', 'ouccmypmvI0YVPyQH8WKy',
-#   '73-4nZXRdn4baVUxiK8yu', 'tjVMzGJ8n9zgK4Kevrdxo'
